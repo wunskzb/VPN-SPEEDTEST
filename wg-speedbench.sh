@@ -1,26 +1,28 @@
 #!/usr/bin/env bash
-# wg-speedbench.sh
-# 交互式导入 WireGuard 配置 -> 在独立 netns 内连接 -> 跑 Speedtest/Cloudflare -> 直接打印结果
-# 不改动宿主的默认路由，避免 SSH 失联；带一键卸载/清理
+# wg-speedbench.sh (fixed)
+# - 交互输入 WG 参数
+# - 先在宿主解析 Endpoint 主机名并替换为 IP:PORT（避免 netns 内 DNS 鸡生蛋蛋生鸡）
+# - 在独立 netns 中启用 WireGuard（不改宿主默认路由）
+# - 测速：仅 Speedtest（官方 Ookla）、仅 Cloudflare、两者皆测
+# - 只打印结果（Speedtest 输出官方结果链接）
+# - clean / uninstall
+
 set -euo pipefail
 
 NS="wgb"                                  # 网络命名空间名
 CONF_DIR="/etc/wireguard"
-CONF_PATH="$CONF_DIR/wgbench.conf"        # 临时配置
+CONF_PATH="$CONF_DIR/wgbench.conf"
 NETNS_DIR="/etc/netns/$NS"
 RESOLV_PATH="$NETNS_DIR/resolv.conf"
 KEEPALIVE="${KEEPALIVE:-25}"
-CF_DL_BYTES="${CF_DL_BYTES:-100000000}"   # Cloudflare下载 100MB
-CF_UL_BYTES="${CF_UL_BYTES:-50000000}"    # Cloudflare上传 50MB
+CF_DL_BYTES="${CF_DL_BYTES:-100000000}"   # Cloudflare 下载 100MB
+CF_UL_BYTES="${CF_UL_BYTES:-50000000}"    # Cloudflare 上传 50MB
 
-# -------------------- 通用函数 --------------------
 info(){ echo -e "\033[1;34m[INFO]\033[0m $*"; }
 ok(){   echo -e "\033[1;32m[DONE]\033[0m $*"; }
 err(){  echo -e "\033[1;31m[ERR ]\033[0m $*" >&2; }
 
-need_root(){
-  [[ $EUID -eq 0 ]] || { err "请用 root 运行（或在前面加 sudo）。"; exit 1; }
-}
+need_root(){ [[ $EUID -eq 0 ]] || { err "请用 root 运行（或 sudo）。"; exit 1; }; }
 
 detect_pm(){
   if command -v apt-get >/dev/null 2>&1; then echo apt
@@ -31,42 +33,69 @@ detect_pm(){
   fi
 }
 
-ensure_cmd(){
-  local bin="$1" pkg_hint="${2:-$1}" pm
-  if ! command -v "$bin" >/dev/null 2>&1; then
-    pm=$(detect_pm)
-    info "安装依赖：$bin"
-    case "$pm" in
-      apt) apt-get update -y && apt-get install -y "$pkg_hint" ;;
-      dnf) dnf install -y "$pkg_hint" ;;
-      yum) yum install -y "$pkg_hint" ;;
-      pacman) pacman -Sy --noconfirm "$pkg_hint" ;;
-      *) err "无法自动安装 $bin，请手动安装后重试。"; exit 1 ;;
-    esac
-  fi
+ensure_pkg(){
+  local pm="$1" pkg="$2"
+  case "$pm" in
+    apt) apt-get update -y && apt-get install -y $pkg ;;
+    dnf) dnf install -y $pkg ;;
+    yum) yum install -y $pkg ;;
+    pacman) pacman -Sy --noconfirm $pkg ;;
+    *) err "无法自动安装：$pkg"; exit 1 ;;
+  esac
 }
 
-ensure_deps(){
-  ensure_cmd ip iproute2
-  ensure_cmd wg-quick wireguard-tools
-  ensure_cmd curl curl
-  # Speedtest：优先官方 speedtest（带结果URL），否则回落到 speedtest-cli
-  if ! command -v speedtest >/dev/null 2>&1; then
-    info "未检测到 Ookla speedtest，安装 python3 与 speedtest-cli 回退方案。"
-    ensure_cmd python3 python3
-    if ! command -v pip3 >/dev/null 2>&1; then ensure_cmd pip3 python3-pip || true; fi
-    pip3 install --user --upgrade speedtest-cli || true
-    if ! command -v speedtest-cli >/dev/null 2>&1; then
-      err "未能安装 speedtest/speedtest-cli；Speedtest 功能将不可用。"
-    fi
+ensure_deps_base(){
+  local pm; pm=$(detect_pm)
+  command -v ip >/dev/null 2>&1        || ensure_pkg "$pm" "iproute2"
+  command -v wg-quick >/dev/null 2>&1  || ensure_pkg "$pm" "wireguard-tools"
+  command -v curl >/dev/null 2>&1      || ensure_pkg "$pm" "curl"
+  command -v getent >/dev/null 2>&1    || true
+}
+
+install_speedtest_official(){
+  # 仅安装 Ookla 官方 speedtest，不再回落 speedtest-cli
+  if command -v speedtest >/dev/null 2>&1; then
+    ok "已检测到官方 speedtest。"
+    return
   fi
-  # jq 可选，仅用于漂亮解析（官方 speedtest --format=json 时使用）
-  command -v jq >/dev/null 2>&1 || true
+  local pm; pm=$(detect_pm)
+  info "准备安装 Ookla 官方 speedtest ..."
+  case "$pm" in
+    apt)
+      # 官方文档安装流程
+      apt-get update -y
+      apt-get install -y gnupg ca-certificates
+      curl -fsSL https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash
+      apt-get install -y speedtest
+      ;;
+    dnf)
+      dnf install -y curl ca-certificates
+      curl -fsSL https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.rpm.sh | bash
+      dnf install -y speedtest
+      ;;
+    yum)
+      yum install -y curl ca-certificates
+      curl -fsSL https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.rpm.sh | bash
+      yum install -y speedtest
+      ;;
+    pacman)
+      err "Arch/Manjaro 请使用 AUR 安装官方 speedtest（如：yay -S ookla-speedtest-bin）后重试。"
+      exit 1
+      ;;
+    *)
+      err "未支持的包管理器，请手动安装官方 speedtest 后再运行。"
+      exit 1
+      ;;
+  esac
+  command -v speedtest >/dev/null 2>&1 || { err "官方 speedtest 安装失败。"; exit 1; }
+  ok "官方 speedtest 安装完成。"
 }
 
 clean_netns(){
   info "清理命名空间与临时文件……"
-  ip netns pids "$NS" >/dev/null 2>&1 && ip netns exec "$NS" wg-quick down "$CONF_PATH" || true
+  if ip netns pids "$NS" >/dev/null 2>&1; then
+    ip netns exec "$NS" wg-quick down "$CONF_PATH" || true
+  fi
   ip netns del "$NS" 2>/dev/null || true
   rm -rf "$NETNS_DIR"
   rm -f "$CONF_PATH"
@@ -75,38 +104,60 @@ clean_netns(){
 
 uninstall_all(){
   clean_netns
-  info "如需移除此脚本，请执行：rm -f $(realpath "$0")"
+  info "如需移除此脚本：rm -f $(realpath "$0")"
   ok "卸载完成。"
 }
 
-trap 'err "脚本异常退出。你可以运行:  sudo bash '$0' clean  进行清理。"' INT TERM
-
-# -------------------- 交互采集配置 --------------------
 prompt_wg_conf(){
-  echo "请按提示输入 WireGuard 参数（来自 Proton/Surfshark/PIA 节点的 WireGuard 信息）："
+  echo "请按提示输入 WireGuard 参数："
   read -rp "PrivateKey: " WG_PRIV
   read -rp "Address (示例 10.2.0.2/32 或 10.2.0.2/32,fd00::2/128): " WG_ADDR
-  read -rp "DNS (例如 1.1.1.1 或 1.1.1.1,1.0.0.1; 可留空): " WG_DNS || true
+  read -rp "DNS（逗号分隔，可留空，默认 1.1.1.1,1.0.0.1）: " WG_DNS || true
   read -rp "PublicKey: " WG_PUB
-  read -rp "Endpoint (示例 host:51820): " WG_ENDPOINT
+  read -rp "Endpoint（主机或IP:端口，如 nl-xxx.surfshark.com:51820）: " WG_ENDPOINT
   read -rp "PresharedKey（可留空）: " WG_PSK || true
+
+  [[ -n "${WG_DNS:-}" ]] || WG_DNS="1.1.1.1,1.0.0.1"
 
   mkdir -p "$CONF_DIR" "$NETNS_DIR"
 
-  # resolv.conf（命名空间内使用）
-  if [[ -n "${WG_DNS:-}" ]]; then
-    echo -e "# resolv for $NS\nnameserver ${WG_DNS//,/\\nnameserver }" > "$RESOLV_PATH"
-  else
-    echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" > "$RESOLV_PATH"
+  # 为 netns 准备 resolv.conf
+  {
+    echo "# resolv for $NS"
+    IFS=',' read -ra DNS_ARR <<< "$WG_DNS"
+    for d in "${DNS_ARR[@]}"; do
+      echo "nameserver ${d}"
+    done
+  } > "$RESOLV_PATH"
+
+  # 先解析 Endpoint 主机名（在宿主上解析，取首个 IPv4/IPv6）
+  local host="$WG_ENDPOINT" port=""
+  if [[ "$WG_ENDPOINT" == *:* ]]; then
+    host="${WG_ENDPOINT%:*}"
+    port="${WG_ENDPOINT##*:}"
   fi
 
-  # 生成 wg-quick 配置（在命名空间内启用）
+  # 如果 host 不是纯 IP，则解析
+  if ! [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ || "$host" =~ : ]]; then
+    info "解析 Endpoint 主机名：$host ..."
+    # 优先取 IPv4；若无则取第一条记录
+    if ip -br addr >/dev/null 2>&1; then :; fi
+    RES_IP=$(getent ahosts "$host" 2>/dev/null | awk '/STREAM|RAW|DGRAM/ {print $1; exit}')
+    [[ -z "${RES_IP:-}" ]] && RES_IP=$(getent hosts "$host" 2>/dev/null | awk '{print $1; exit}')
+    if [[ -z "${RES_IP:-}" ]]; then
+      err "无法解析 Endpoint 主机名：$host"
+      exit 1
+    fi
+    ok "解析到：$RES_IP"
+    WG_ENDPOINT="${RES_IP}:${port}"
+  fi
+
+  # 写入 wg-quick 配置（在 netns 内启用）
   {
     echo "[Interface]"
     echo "PrivateKey = $WG_PRIV"
     echo "Address = $WG_ADDR"
-    # Table/PreUp/PostDown 不必改，wg-quick 在 netns 内会设置默认路由，仅影响该 netns
-    [[ -n "${WG_DNS:-}" ]] && echo "DNS = ${WG_DNS}"
+    echo "DNS = ${WG_DNS}"
     echo
     echo "[Peer]"
     echo "PublicKey = $WG_PUB"
@@ -117,24 +168,23 @@ prompt_wg_conf(){
   } > "$CONF_PATH"
 
   ok "已写入临时配置：$CONF_PATH"
+  info "Endpoint 已写为：$(grep -E '^Endpoint' "$CONF_PATH" | awk '{print $3}')"
 }
 
-# -------------------- 建立 netns 并连接 --------------------
 bring_up(){
   ip netns add "$NS" 2>/dev/null || true
-  # 准备 /etc/netns/$NS/resolv.conf（上面已写）
-  # 在 netns 中启用 WireGuard
   info "在命名空间 $NS 内启动 WireGuard……"
   ip netns exec "$NS" wg-quick up "$CONF_PATH"
-  ok "WireGuard 已连接（仅在 $NS 内生效，宿主路由不变）。"
+  ok "WireGuard 已连接（仅在 $NS 内生效）。"
+  info "命名空间 DNS 配置："
+  ip netns exec "$NS" cat /etc/resolv.conf || true
 }
 
 bring_down(){
   ip netns exec "$NS" wg-quick down "$CONF_PATH" || true
 }
 
-# -------------------- 测速实现 --------------------
-# Cloudflare：返回 Mbps（两位小数）
+# ------------ Cloudflare 速度（Mbps，两位小数） ------------
 cf_download(){
   local bps
   bps=$(ip netns exec "$NS" curl -s -o /dev/null -w "%{speed_download}" \
@@ -149,54 +199,47 @@ cf_upload(){
         "https://speed.cloudflare.com/__up")
   awk -v b="$bps" 'BEGIN{printf "%.2f", b*8/1000000}'
 }
-
 do_cloudflare(){
   info "Cloudflare（speed.cloudflare.com）测速中……"
   local dl ul
   dl=$(cf_download)
   ul=$(cf_upload)
-  ok "Cloudflare 结果：下载 ${dl} Mbps，上传 ${ul} Mbps"
+  ok "Cloudflare：下行 ${dl} Mbps，上行 ${ul} Mbps"
 }
 
+# ------------ Ookla 官方 Speedtest ------------
 do_speedtest(){
-  info "Ookla Speedtest 测试中……（优先使用官方 speedtest）"
+  command -v speedtest >/dev/null 2>&1 || { err "未检测到官方 speedtest。"; exit 1; }
+  info "Ookla Speedtest 测试中……"
+  # 用 JSON 输出，便于解析结果链接
+  local out; out=$(ip netns exec "$NS" speedtest --accept-license --accept-gdpr --format=json 2>/dev/null || true)
+  if [[ -z "$out" ]]; then
+    # 再试一次普通输出
+    out=$(ip netns exec "$NS" speedtest 2>/dev/null || true)
+  fi
+
   local link="N/A" dl="-" ul="-" ping="-"
-  if command -v speedtest >/dev/null 2>&1; then
-    # 官方 speedtest：JSON 可包含结果链接
-    local out
-    out=$(ip netns exec "$NS" speedtest --accept-license --accept-gdpr --format=json 2>/dev/null || true)
-    if [[ -n "$out" ]]; then
-      if command -v jq >/dev/null 2>&1; then
-        dl=$(echo "$out" | jq -r '.download.bandwidth' 2>/dev/null); [[ "$dl" != "null" && -n "$dl" ]] && dl=$(awk -v b="$dl" 'BEGIN{printf "%.2f", b*8/1000000}')
-        ul=$(echo "$out" | jq -r '.upload.bandwidth'   2>/dev/null); [[ "$ul" != "null" && -n "$ul" ]] && ul=$(awk -v b="$ul" 'BEGIN{printf "%.2f", b*8/1000000}')
-        ping=$(echo "$out" | jq -r '.ping.latency'     2>/dev/null)
-        link=$(echo "$out" | jq -r '.result.url // empty')
-      else
-        # 无 jq 时，退回纯文本
-        out=$(ip netns exec "$NS" speedtest 2>/dev/null || true)
-        dl=$(echo "$out" | awk '/Download:/{print $(NF-1)}')
-        ul=$(echo "$out" | awk '/Upload:/{print $(NF-1)}')
-        ping=$(echo "$out" | awk '/Latency:|Ping:/{print $2}')
-      fi
-    fi
-  elif command -v speedtest-cli >/dev/null 2>&1; then
-    local out
-    out=$(ip netns exec "$NS" speedtest-cli --share 2>/dev/null || ip netns exec "$NS" speedtest-cli 2>/dev/null || true)
+  if command -v jq >/dev/null 2>&1 && [[ "$(printf "%s" "$out" | head -c 1)" == "{" ]]; then
+    dl=$(echo "$out"   | jq -r '.download.bandwidth // empty'); [[ -n "$dl" ]] && dl=$(awk -v b="$dl" 'BEGIN{printf "%.2f", b*8/1000000}')
+    ul=$(echo "$out"   | jq -r '.upload.bandwidth   // empty'); [[ -n "$ul" ]] && ul=$(awk -v b="$ul" 'BEGIN{printf "%.2f", b*8/1000000}')
+    ping=$(echo "$out" | jq -r '.ping.latency       // empty')
+    link=$(echo "$out" | jq -r '.result.url         // empty')
+  else
+    # 文本兜底（有些环境 --format 不可用）
     dl=$(echo "$out" | awk '/Download:/{print $(NF-1)}')
     ul=$(echo "$out" | awk '/Upload:/{print $(NF-1)}')
-    ping=$(echo "$out" | awk '/Ping:/{print $2}')
-    link=$(echo "$out" | awk '/Share results:/{print $3}')
-  else
-    err "未找到 speedtest 或 speedtest-cli。"
+    ping=$(echo "$out" | awk '/Latency:|Ping:/{print $2}')
+    link=$(echo "$out" | awk '/Result URL:/{print $3}')
   fi
-  ok "Speedtest 结果：下载 ${dl:-?} Mbps，上传 ${ul:-?} Mbps，Ping ${ping:-?} ms"
+
+  ok "Speedtest：下行 ${dl:-?} Mbps，上行 ${ul:-?} Mbps，Ping ${ping:-?} ms"
   [[ -n "${link:-}" ]] && echo "结果链接：${link}"
 }
 
 menu(){
   cat <<EOF
 选择测试项目：
-  1) 仅 Speedtest
+  1) 仅 Speedtest（官方 Ookla）
   2) 仅 Cloudflare
   3) 两者都测
 EOF
@@ -209,11 +252,10 @@ EOF
   esac
 }
 
-# -------------------- 主入口 --------------------
 usage(){
   cat <<'EOF'
 用法：
-  sudo ./wg-speedbench.sh           # 交互式：输入WG参数 -> 连接 -> 选择测速
+  sudo ./wg-speedbench.sh           # 交互：输入 WG 参数 -> 连接 -> 选择测速
   sudo ./wg-speedbench.sh clean     # 断开并清理命名空间与临时配置
   sudo ./wg-speedbench.sh uninstall # 一键卸载（含清理）
 EOF
@@ -221,9 +263,18 @@ EOF
 
 main(){
   case "${1:-}" in
-    clean)     need_root; ensure_deps; bring_down; clean_netns; exit 0 ;;
-    uninstall) need_root; ensure_deps; uninstall_all; exit 0 ;;
-    "" )       need_root; ensure_deps; prompt_wg_conf; bring_up; menu; bring_down; ok "测试完成（已断开）。提示：可执行  sudo ./wg-speedbench.sh clean  彻底清理。";;
+    clean)     need_root; bring_down; clean_netns; exit 0 ;;
+    uninstall) need_root; bring_down; uninstall_all; exit 0 ;;
+    "" )
+      need_root
+      ensure_deps_base
+      install_speedtest_official
+      prompt_wg_conf
+      bring_up
+      menu
+      bring_down
+      ok "测试完成（连接已断开）。如需彻底清理：sudo ./wg-speedbench.sh clean"
+      ;;
     * ) usage; exit 1;;
   esac
 }
