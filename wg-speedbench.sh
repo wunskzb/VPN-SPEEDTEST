@@ -62,12 +62,17 @@ install_speedtest_official(){
   info "准备安装 Ookla 官方 speedtest ..."
   case "$pm" in
     apt)
-      # 官方文档安装流程
-      apt-get update -y
-      apt-get install -y gnupg ca-certificates
-      curl -fsSL https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash
-      apt-get install -y speedtest
-      ;;
+  # 官方文档安装流程
+  apt-get update -y
+  apt-get install -y gnupg ca-certificates
+  curl -fsSL https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash || true
+  if ! apt-get install -y speedtest >/dev/null 2>&1; then
+    info "apt 未找到 speedtest，尝试直接下载官方 .deb 包"
+    curl -LO https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-amd64.deb
+    apt install -y ./ookla-speedtest-1.2.0-linux-amd64.deb
+  fi
+  ;;
+
     dnf)
       dnf install -y curl ca-certificates
       curl -fsSL https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.rpm.sh | bash
