@@ -1,22 +1,21 @@
 #!/usr/bin/env bash
-# wg-speedbench.sh (fixed)
+# wg-speedbench.sh (Cloudflare-only)
 # - 交互输入 WG 参数
-# - 先在宿主解析 Endpoint 主机名并替换为 IP:PORT（避免 netns 内 DNS 鸡生蛋蛋生鸡）
-# - 在独立 netns 中启用 WireGuard（不改宿主默认路由）
-# - 测速：仅 Speedtest（官方 Ookla）、仅 Cloudflare、两者皆测
-# - 只打印结果（Speedtest 输出官方结果链接）
+# - 宿主解析 Endpoint 主机名 -> 写 IP:PORT（避免 netns 解析失败）
+# - 独立 netns 内启用 WireGuard（不改宿主默认路由）
+# - 仅测 Cloudflare 下载/上传/两者
 # - clean / uninstall
 
 set -euo pipefail
 
-NS="wgb"                                  # 网络命名空间名
+NS="wgb"                                  # 网络命名空间
 CONF_DIR="/etc/wireguard"
 CONF_PATH="$CONF_DIR/wgbench.conf"
 NETNS_DIR="/etc/netns/$NS"
 RESOLV_PATH="$NETNS_DIR/resolv.conf"
 KEEPALIVE="${KEEPALIVE:-25}"
-CF_DL_BYTES="${CF_DL_BYTES:-100000000}"   # Cloudflare 下载 100MB
-CF_UL_BYTES="${CF_UL_BYTES:-50000000}"    # Cloudflare 上传 50MB
+CF_DL_BYTES="${CF_DL_BYTES:-100000000}"   # 下载测试字节数 (默认 100MB)
+CF_UL_BYTES="${CF_UL_BYTES:-50000000}"    # 上传测试字节数 (默认 50MB)
 
 info(){ echo -e "\033[1;34m[INFO]\033[0m $*"; }
 ok(){   echo -e "\033[1;32m[DONE]\033[0m $*"; }
@@ -44,86 +43,12 @@ ensure_pkg(){
   esac
 }
 
-ensure_deps_base(){
+ensure_deps(){
   local pm; pm=$(detect_pm)
   command -v ip >/dev/null 2>&1        || ensure_pkg "$pm" "iproute2"
   command -v wg-quick >/dev/null 2>&1  || ensure_pkg "$pm" "wireguard-tools"
   command -v curl >/dev/null 2>&1      || ensure_pkg "$pm" "curl"
   command -v getent >/dev/null 2>&1    || true
-}
-
-install_speedtest_official(){
-  # 只用 Ookla 官方 speedtest，不用 speedtest-cli
-  if command -v speedtest >/dev/null 2>&1; then
-    ok "已检测到官方 speedtest。"
-    return
-  fi
-
-  local pm; pm=$(detect_pm)
-  info "准备安装 Ookla 官方 speedtest ..."
-  case "$pm" in
-    apt)
-      apt-get update -y || true
-      apt-get install -y gnupg ca-certificates curl || true
-
-      # 尝试添加官方仓库，但不因失败退出（plucky 不被支持会 404）
-      set +e
-      curl -fsSL https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash
-      repo_rc=$?
-      apt-get update -y
-      apt-get install -y speedtest
-      apt_rc=$?
-      set -e
-
-      if [ ${apt_rc:-1} -ne 0 ]; then
-        info "apt 仓库不可用或未找到 speedtest，回退为官方 .deb 安装"
-        # 根据架构选择包名
-        arch=$(dpkg --print-architecture 2>/dev/null || echo amd64)
-        case "$arch" in
-          amd64|x86_64) deb_arch="amd64" ;;
-          arm64|aarch64) deb_arch="arm64" ;;
-          armhf) deb_arch="armhf" ;;
-          i386|i686) deb_arch="i386" ;;   # 基本用不到
-          *) deb_arch="amd64" ;;
-        esac
-        ver="${SPEEDTEST_VER:-1.2.0}"   # 需要更新时改这个版本号
-        url="https://install.speedtest.net/app/cli/ookla-speedtest-${ver}-linux-${deb_arch}.deb"
-        curl -fLo /tmp/ookla-speedtest.deb "$url"
-        apt install -y /tmp/ookla-speedtest.deb
-      fi
-      ;;
-
-    dnf)
-      dnf install -y curl ca-certificates || true
-      curl -fsSL https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.rpm.sh | bash || true
-      if ! dnf install -y speedtest >/dev/null 2>&1; then
-        err "RPM 系列暂未做 .rpm 兜底，请手动安装官方 speedtest 后重试。"
-        exit 1
-      fi
-      ;;
-
-    yum)
-      yum install -y curl ca-certificates || true
-      curl -fsSL https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.rpm.sh | bash || true
-      if ! yum install -y speedtest >/dev/null 2>&1; then
-        err "RPM 系列暂未做 .rpm 兜底，请手动安装官方 speedtest 后重试。"
-        exit 1
-      fi
-      ;;
-
-    pacman)
-      err "Arch/Manjaro 请用 AUR 安装 ookla-speedtest-bin（如：yay -S ookla-speedtest-bin）后再运行脚本。"
-      exit 1
-      ;;
-
-    *)
-      err "未支持的包管理器；请手动安装官方 speedtest 后再运行。"
-      exit 1
-      ;;
-  esac
-
-  command -v speedtest >/dev/null 2>&1 || { err "官方 speedtest 安装失败。"; exit 1; }
-  ok "官方 speedtest 安装完成。"
 }
 
 clean_netns(){
@@ -156,7 +81,7 @@ prompt_wg_conf(){
 
   mkdir -p "$CONF_DIR" "$NETNS_DIR"
 
-  # 为 netns 准备 resolv.conf
+  # 为 netns 写 resolv.conf
   {
     echo "# resolv for $NS"
     IFS=',' read -ra DNS_ARR <<< "$WG_DNS"
@@ -165,29 +90,22 @@ prompt_wg_conf(){
     done
   } > "$RESOLV_PATH"
 
-  # 先解析 Endpoint 主机名（在宿主上解析，取首个 IPv4/IPv6）
+  # 宿主解析 Endpoint → IP:PORT
   local host="$WG_ENDPOINT" port=""
   if [[ "$WG_ENDPOINT" == *:* ]]; then
     host="${WG_ENDPOINT%:*}"
     port="${WG_ENDPOINT##*:}"
   fi
-
-  # 如果 host 不是纯 IP，则解析
   if ! [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ || "$host" =~ : ]]; then
     info "解析 Endpoint 主机名：$host ..."
-    # 优先取 IPv4；若无则取第一条记录
-    if ip -br addr >/dev/null 2>&1; then :; fi
     RES_IP=$(getent ahosts "$host" 2>/dev/null | awk '/STREAM|RAW|DGRAM/ {print $1; exit}')
     [[ -z "${RES_IP:-}" ]] && RES_IP=$(getent hosts "$host" 2>/dev/null | awk '{print $1; exit}')
-    if [[ -z "${RES_IP:-}" ]]; then
-      err "无法解析 Endpoint 主机名：$host"
-      exit 1
-    fi
+    [[ -z "${RES_IP:-}" ]] && { err "无法解析 Endpoint：$host"; exit 1; }
     ok "解析到：$RES_IP"
     WG_ENDPOINT="${RES_IP}:${port}"
   fi
 
-  # 写入 wg-quick 配置（在 netns 内启用）
+  # 写入临时 wg-quick 配置（仅在 netns 内使用）
   {
     echo "[Interface]"
     echo "PrivateKey = $WG_PRIV"
@@ -234,55 +152,23 @@ cf_upload(){
         "https://speed.cloudflare.com/__up")
   awk -v b="$bps" 'BEGIN{printf "%.2f", b*8/1000000}'
 }
-do_cloudflare(){
-  info "Cloudflare（speed.cloudflare.com）测速中……"
-  local dl ul
-  dl=$(cf_download)
-  ul=$(cf_upload)
-  ok "Cloudflare：下行 ${dl} Mbps，上行 ${ul} Mbps"
-}
 
-# ------------ Ookla 官方 Speedtest ------------
-do_speedtest(){
-  command -v speedtest >/dev/null 2>&1 || { err "未检测到官方 speedtest。"; exit 1; }
-  info "Ookla Speedtest 测试中……"
-  # 用 JSON 输出，便于解析结果链接
-  local out; out=$(ip netns exec "$NS" speedtest --accept-license --accept-gdpr --format=json 2>/dev/null || true)
-  if [[ -z "$out" ]]; then
-    # 再试一次普通输出
-    out=$(ip netns exec "$NS" speedtest 2>/dev/null || true)
-  fi
-
-  local link="N/A" dl="-" ul="-" ping="-"
-  if command -v jq >/dev/null 2>&1 && [[ "$(printf "%s" "$out" | head -c 1)" == "{" ]]; then
-    dl=$(echo "$out"   | jq -r '.download.bandwidth // empty'); [[ -n "$dl" ]] && dl=$(awk -v b="$dl" 'BEGIN{printf "%.2f", b*8/1000000}')
-    ul=$(echo "$out"   | jq -r '.upload.bandwidth   // empty'); [[ -n "$ul" ]] && ul=$(awk -v b="$ul" 'BEGIN{printf "%.2f", b*8/1000000}')
-    ping=$(echo "$out" | jq -r '.ping.latency       // empty')
-    link=$(echo "$out" | jq -r '.result.url         // empty')
-  else
-    # 文本兜底（有些环境 --format 不可用）
-    dl=$(echo "$out" | awk '/Download:/{print $(NF-1)}')
-    ul=$(echo "$out" | awk '/Upload:/{print $(NF-1)}')
-    ping=$(echo "$out" | awk '/Latency:|Ping:/{print $2}')
-    link=$(echo "$out" | awk '/Result URL:/{print $3}')
-  fi
-
-  ok "Speedtest：下行 ${dl:-?} Mbps，上行 ${ul:-?} Mbps，Ping ${ping:-?} ms"
-  [[ -n "${link:-}" ]] && echo "结果链接：${link}"
-}
+do_cloudflare_dl(){ info "Cloudflare 下载测速中……"; local dl; dl=$(cf_download); ok "下载 ${dl} Mbps"; }
+do_cloudflare_ul(){ info "Cloudflare 上传测速中……"; local ul; ul=$(cf_upload); ok "上传 ${ul} Mbps"; }
+do_cloudflare_both(){ do_cloudflare_dl; echo; do_cloudflare_ul; }
 
 menu(){
   cat <<EOF
 选择测试项目：
-  1) 仅 Speedtest（官方 Ookla）
-  2) 仅 Cloudflare
-  3) 两者都测
+  1) 仅下载（Cloudflare）
+  2) 仅上传（Cloudflare）
+  3) 下载+上传（Cloudflare）
 EOF
   read -rp "请输入 1/2/3: " choice
   case "$choice" in
-    1) do_speedtest ;;
-    2) do_cloudflare ;;
-    3) do_speedtest; echo; do_cloudflare ;;
+    1) do_cloudflare_dl ;;
+    2) do_cloudflare_ul ;;
+    3) do_cloudflare_both ;;
     *) err "无效选择。"; exit 1 ;;
   esac
 }
@@ -290,9 +176,12 @@ EOF
 usage(){
   cat <<'EOF'
 用法：
-  sudo ./wg-speedbench.sh           # 交互：输入 WG 参数 -> 连接 -> 选择测速
+  sudo ./wg-speedbench.sh           # 交互：输入 WG 参数 -> 连接 -> 选择 Cloudflare 测速
   sudo ./wg-speedbench.sh clean     # 断开并清理命名空间与临时配置
   sudo ./wg-speedbench.sh uninstall # 一键卸载（含清理）
+
+可通过环境变量调整测试大小：
+  CF_DL_BYTES=200000000 CF_UL_BYTES=100000000 sudo ./wg-speedbench.sh
 EOF
 }
 
@@ -302,8 +191,7 @@ main(){
     uninstall) need_root; bring_down; uninstall_all; exit 0 ;;
     "" )
       need_root
-      ensure_deps_base
-      install_speedtest_official
+      ensure_deps
       prompt_wg_conf
       bring_up
       menu
