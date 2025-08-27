@@ -53,45 +53,75 @@ ensure_deps_base(){
 }
 
 install_speedtest_official(){
-  # 仅安装 Ookla 官方 speedtest，不再回落 speedtest-cli
+  # 只用 Ookla 官方 speedtest，不用 speedtest-cli
   if command -v speedtest >/dev/null 2>&1; then
     ok "已检测到官方 speedtest。"
     return
   fi
+
   local pm; pm=$(detect_pm)
   info "准备安装 Ookla 官方 speedtest ..."
   case "$pm" in
     apt)
-  # 官方文档安装流程
-  apt-get update -y
-  apt-get install -y gnupg ca-certificates
-  curl -fsSL https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash || true
-  if ! apt-get install -y speedtest >/dev/null 2>&1; then
-    info "apt 未找到 speedtest，尝试直接下载官方 .deb 包"
-    curl -LO https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-amd64.deb
-    apt install -y ./ookla-speedtest-1.2.0-linux-amd64.deb
-  fi
-  ;;
+      apt-get update -y || true
+      apt-get install -y gnupg ca-certificates curl || true
+
+      # 尝试添加官方仓库，但不因失败退出（plucky 不被支持会 404）
+      set +e
+      curl -fsSL https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash
+      repo_rc=$?
+      apt-get update -y
+      apt-get install -y speedtest
+      apt_rc=$?
+      set -e
+
+      if [ ${apt_rc:-1} -ne 0 ]; then
+        info "apt 仓库不可用或未找到 speedtest，回退为官方 .deb 安装"
+        # 根据架构选择包名
+        arch=$(dpkg --print-architecture 2>/dev/null || echo amd64)
+        case "$arch" in
+          amd64|x86_64) deb_arch="amd64" ;;
+          arm64|aarch64) deb_arch="arm64" ;;
+          armhf) deb_arch="armhf" ;;
+          i386|i686) deb_arch="i386" ;;   # 基本用不到
+          *) deb_arch="amd64" ;;
+        esac
+        ver="${SPEEDTEST_VER:-1.2.0}"   # 需要更新时改这个版本号
+        url="https://install.speedtest.net/app/cli/ookla-speedtest-${ver}-linux-${deb_arch}.deb"
+        curl -fLo /tmp/ookla-speedtest.deb "$url"
+        apt install -y /tmp/ookla-speedtest.deb
+      fi
+      ;;
 
     dnf)
-      dnf install -y curl ca-certificates
-      curl -fsSL https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.rpm.sh | bash
-      dnf install -y speedtest
+      dnf install -y curl ca-certificates || true
+      curl -fsSL https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.rpm.sh | bash || true
+      if ! dnf install -y speedtest >/dev/null 2>&1; then
+        err "RPM 系列暂未做 .rpm 兜底，请手动安装官方 speedtest 后重试。"
+        exit 1
+      fi
       ;;
+
     yum)
-      yum install -y curl ca-certificates
-      curl -fsSL https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.rpm.sh | bash
-      yum install -y speedtest
+      yum install -y curl ca-certificates || true
+      curl -fsSL https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.rpm.sh | bash || true
+      if ! yum install -y speedtest >/dev/null 2>&1; then
+        err "RPM 系列暂未做 .rpm 兜底，请手动安装官方 speedtest 后重试。"
+        exit 1
+      fi
       ;;
+
     pacman)
-      err "Arch/Manjaro 请使用 AUR 安装官方 speedtest（如：yay -S ookla-speedtest-bin）后重试。"
+      err "Arch/Manjaro 请用 AUR 安装 ookla-speedtest-bin（如：yay -S ookla-speedtest-bin）后再运行脚本。"
       exit 1
       ;;
+
     *)
-      err "未支持的包管理器，请手动安装官方 speedtest 后再运行。"
+      err "未支持的包管理器；请手动安装官方 speedtest 后再运行。"
       exit 1
       ;;
   esac
+
   command -v speedtest >/dev/null 2>&1 || { err "官方 speedtest 安装失败。"; exit 1; }
   ok "官方 speedtest 安装完成。"
 }
