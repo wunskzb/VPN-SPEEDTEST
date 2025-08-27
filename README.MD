@@ -8,6 +8,6 @@
 
 ## 快速开始
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<your-username>/<your-repo>/main/wg-speedbench.sh -o wg-speedbench.sh
+curl -fsSL https://raw.githubusercontent.com/wunskzb/VPN-SPEEDTEST/main/wg-speedbench.sh -o wg-speedbench.sh
 chmod +x wg-speedbench.sh
 sudo ./wg-speedbench.sh
