@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# wg-speedbench.sh (Cloudflare-only)
+# wg-speedbench.sh (Cloudflare-only, fixed)
 # - 交互输入 WG 参数
 # - 宿主解析 Endpoint 主机名 -> 写 IP:PORT（避免 netns 解析失败）
 # - 独立 netns 内启用 WireGuard（不改宿主默认路由）
@@ -81,7 +81,7 @@ prompt_wg_conf(){
 
   mkdir -p "$CONF_DIR" "$NETNS_DIR"
 
-  # 为 netns 写 resolv.conf
+  # 为 netns 写 resolv.conf（glibc 会自动在该 netns 使用它）
   {
     echo "# resolv for $NS"
     IFS=',' read -ra DNS_ARR <<< "$WG_DNS"
@@ -105,19 +105,18 @@ prompt_wg_conf(){
     WG_ENDPOINT="${RES_IP}:${port}"
   fi
 
-  # 写入临时 wg-quick 配置（仅在 netns 内使用）
+  # 写 wg-quick 配置（⚠ 不写 DNS=，避免 wg-quick 调 resolvconf）
   {
     echo "[Interface]"
     echo "PrivateKey = $WG_PRIV"
     echo "Address = $WG_ADDR"
-    echo "DNS = ${WG_DNS}"
     echo
     echo "[Peer]"
     echo "PublicKey = $WG_PUB"
     [[ -n "${WG_PSK:-}" ]] && echo "PresharedKey = $WG_PSK"
     echo "AllowedIPs = 0.0.0.0/0, ::/0"
     echo "Endpoint = $WG_ENDPOINT"
-    echo "PersistentKeepalive = $KEEPALIVE"
+    echo "PersistentKeepalive = ${KEEPALIVE:-25}"
   } > "$CONF_PATH"
 
   ok "已写入临时配置：$CONF_PATH"
@@ -126,8 +125,13 @@ prompt_wg_conf(){
 
 bring_up(){
   ip netns add "$NS" 2>/dev/null || true
+  # 先把 loopback 拉起，避免 “Network is unreachable”
+  ip netns exec "$NS" ip link set lo up
+
   info "在命名空间 $NS 内启动 WireGuard……"
-  ip netns exec "$NS" wg-quick up "$CONF_PATH"
+  # 禁用 wg-quick 的 DNS 操作（我们用 /etc/netns/$NS/resolv.conf）
+  ip netns exec "$NS" env WG_QUICK_DNS=off wg-quick up "$CONF_PATH"
+
   ok "WireGuard 已连接（仅在 $NS 内生效）。"
   info "命名空间 DNS 配置："
   ip netns exec "$NS" cat /etc/resolv.conf || true
@@ -140,17 +144,20 @@ bring_down(){
 # ------------ Cloudflare 速度（Mbps，两位小数） ------------
 cf_download(){
   local bps
-  bps=$(ip netns exec "$NS" curl -s -o /dev/null -w "%{speed_download}" \
-        "https://speed.cloudflare.com/__down?bytes=${CF_DL_BYTES}")
-  awk -v b="$bps" 'BEGIN{printf "%.2f", b*8/1000000}'
+  bps=$(ip netns exec "$NS" curl -s -o /tmp/cf_down.bin -w "%{speed_download}" \
+        "https://speed.cloudflare.com/__down?bytes=${CF_DL_BYTES}" \
+        || true)
+  rm -f /tmp/cf_down.bin
+  awk -v b="${bps:-0}" 'BEGIN{printf "%.2f", b*8/1000000}'
 }
 cf_upload(){
   local bps
   bps=$(head -c "$CF_UL_BYTES" /dev/urandom | \
         ip netns exec "$NS" curl -s -o /dev/null -w "%{speed_upload}" -X POST \
         -H "Content-Type: application/octet-stream" --data-binary @- \
-        "https://speed.cloudflare.com/__up")
-  awk -v b="$bps" 'BEGIN{printf "%.2f", b*8/1000000}'
+        "https://speed.cloudflare.com/__up" \
+        || true)
+  awk -v b="${bps:-0}" 'BEGIN{printf "%.2f", b*8/1000000}'
 }
 
 do_cloudflare_dl(){ info "Cloudflare 下载测速中……"; local dl; dl=$(cf_download); ok "下载 ${dl} Mbps"; }
